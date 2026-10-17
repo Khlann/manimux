@@ -30,6 +30,11 @@ ManiMux 是一个**可扩展的 real-world manipulation harness（真机操作�
 > 安装、工作站配置、模型部署、RoboGUI 使用，以及各组件的接入 protocol。
 > 让 agent 开发时，从 [development skill](.agents/skills/manimux-development/SKILL.md) 开始。
 
+## RPent 接入
+
+通过 [RPent YAM VLA 适配](docs/integrations/rpent-yam.md)，将 RPent 推理的动作交给
+ManiMux 执行，复用现有环境接口与控制循环。
+
 ## 最新动态
 
 - **2026-10-02** — 新增 [ALOHA-AgileX](docs/usage/aloha.md) 和 [PiPER](docs/usage/piper.md) RoboGUI 演示，以及实验性的 [ARX X5 / PiPER 控制器](docs/usage/can-arms.md)，真机验证尚未完成。

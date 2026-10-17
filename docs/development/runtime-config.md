@@ -257,3 +257,15 @@ per-tick vendor branch. There is currently no general executor entry-point loade
 The live dashboard's `records.py` reads finalized records; `action_replay.py` owns
 hardware-free trajectory display. Keep these consumers out of the control loop.
 The [research workflow](../usage/research.md) describes current UI and identity fields.
+
+## Externally submitted actions
+
+`EdgeRuntime(..., external=ExternalActionSource())` accepts one bounded action
+batch from an external orchestrator without creating a policy worker. The same
+hardware loop retains timeline, executor, safety, recording and cleanup ownership.
+The initial implementation requires direct, serial, inline, unblended execution
+without automatic start/Home or warmup; the producer owns action timing and
+selection. Completion counts successfully dispatched source rows and is
+acknowledged on the following control tick. Stop is latched and handled on the
+control thread. See the [RPent YAM guide](../integrations/rpent-yam.md) for the
+concrete environment protocol and limitations.

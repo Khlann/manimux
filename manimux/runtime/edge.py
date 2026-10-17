@@ -28,6 +28,7 @@ from manimux.robogui import RoboGUIBridge
 from manimux.runtime.decode_forecast import DecodeForecast
 from manimux.runtime.diagnostics import build_plan_boundary_payload
 from manimux.runtime.executors import DirectExecutor, Executor, MPCExecutor, SmoothExecutor
+from manimux.runtime.external import ExternalActionSource
 from manimux.runtime.inference import (
     DefaultChunkStrategy,
     InferenceStrategy,
@@ -153,7 +154,24 @@ class EdgeRuntime:
         clock: Clock | None = None,
         strategy: InferenceStrategy | None = None,
         launch_mode: str = "run",
+        external: ExternalActionSource | None = None,
     ) -> None:
+        self._external = external
+        if external is not None and (
+            config["executor"]["type"] != "direct"
+            or config["executor"]["motion_limits"] is not None
+            or config["policy"]["action_decoding"] != "inline"
+            or config["inference"]["inference_schedule"] != "serial"
+            or config["inference"]["blend_policy_steps"] != 0
+            or config["inference"]["action_start_mode"] != "first_step_when_ready"
+            or config["run"].get("warmup_before_start")
+            or config["robot"]["options"].get("home_on_close")
+            or config["robot"]["options"].get("move_to_start_on_connect")
+        ):
+            raise ValueError(
+                "external execution requires direct, serial, inline, unblended "
+                "actions without motion limits, warmup, start motion or Home"
+            )
         self._rollout_identity = rollout_identity(config["run"])
         self._evaluation = evaluation_parameters(config.get("evaluation"))
         self._config = config
@@ -205,8 +223,14 @@ class EdgeRuntime:
             mode=config["inference"]["decode_forecast_mode"],
         )
         self._session_id = f"session-{uuid.uuid4().hex}"
-        self._worker = PolicyWorkerClient(
-            config["policy"], self._session_id, multi_inflight=self._multi_inflight,
+        self._worker = (
+            None
+            if external is not None
+            else PolicyWorkerClient(
+                config["policy"],
+                self._session_id,
+                multi_inflight=self._multi_inflight,
+            )
         )
         self._timeline = self._build_timeline()
         self._executor = self._build_executor()
@@ -253,7 +277,8 @@ class EdgeRuntime:
 
     def _build_adapter(self):
         adapter = build_policy_adapter(
-            self._config["robot"], self._config["policy"],
+            self._config["robot"],
+            self._config["policy"],
             kinematics=self._robot.kinematics,
             motion_limits=self._config["executor"]["motion_limits"],
         )
@@ -319,6 +344,8 @@ class EdgeRuntime:
         return start_ns, state, "measured_state"
 
     def _validate_policy_capabilities(self) -> None:
+        if self._external is not None:
+            return
         capabilities = getattr(self._worker, "capabilities", PolicyCapabilities())
         missing = self._strategy.required_sampling_modes.difference(capabilities.sampling_modes)
         if missing:
@@ -340,7 +367,9 @@ class EdgeRuntime:
     def run(self) -> RunResult:  # noqa: C901 - the safety-critical loop stays linear
         started_wall = time.perf_counter()
         sensor_reader = SensorReader(
-            self._sensors, self._clock, **self._config["run"].get("sensor_reading", {}),
+            self._sensors,
+            self._clock,
+            **self._config["run"].get("sensor_reading", {}),
         )
         episode_id = _next_rollout_id(self._run_dir)
         timing = LoopTiming(
@@ -412,18 +441,31 @@ class EdgeRuntime:
         warmup = None
         try:
             if self._config["run"].get("warmup_before_start", False):
+                assert self._worker is not None
                 warmup = PolicyWarmup(
-                    self._config, worker=self._worker,
+                    self._config,
+                    worker=self._worker,
                     strategy=build_inference_strategy(self._config),
-                    adapter=self._build_adapter(), session_id=self._session_id, clock=self._clock,
+                    adapter=self._build_adapter(),
+                    session_id=self._session_id,
+                    clock=self._clock,
                 )
             sensor_reader.start()
-            self._worker.start()
-            logger.info("policy_worker_ready session=%s", self._session_id)
+            if self._worker is not None:
+                self._worker.start()
+            logger.info(
+                "runtime_input_ready session=%s external=%s",
+                self._session_id,
+                self._external is not None,
+            )
             if self._decoder is not None:
                 self._decoder.start()
             self._validate_policy_capabilities()
-            capabilities = getattr(self._worker, "capabilities", PolicyCapabilities())
+            capabilities = (
+                self._external.capabilities
+                if self._external is not None
+                else getattr(self._worker, "capabilities", PolicyCapabilities())
+            )
             recorder.update_metadata(
                 policy_backend=dict(capabilities.backend_metadata),
             )
@@ -474,7 +516,7 @@ class EdgeRuntime:
             robogui_episode_metadata["recovery_available"] = False
             # The active runtime owns Home; idle recovery remains service-owned.
             robogui_episode_metadata["home_available"] = (
-                "home" in self._robot.recovery_actions
+                self._external is None and "home" in self._robot.recovery_actions
             )
             self._robogui.set_state_metadata(robogui_episode_metadata)
             with stage("robogui_publish_event"):
@@ -485,11 +527,15 @@ class EdgeRuntime:
             next_tick_ns = self._clock.now_ns()
 
             while steps < self._config["run"]["max_control_steps"]:
+                if self._external is not None and self._external.shutdown.is_set():
+                    terminal_reason = "external_shutdown"
+                    break
                 timing.begin(
                     scheduled_start_ns=next_tick_ns,
                     phase=(
                         f"warmup_{warmup.phase}"
-                        if warmup is not None and not warmup.complete else self._state.value.lower()
+                        if warmup is not None and not warmup.complete
+                        else self._state.value.lower()
                     ),
                     step=steps,
                 )
@@ -500,34 +546,40 @@ class EdgeRuntime:
                     self._safety.validate_state(state)
                 with stage("camera_read", mode=sensor_reader.mode):
                     frames = sensor_reader.read()
+                if self._external is not None:
+                    self._external.observe_tick(ObservationSnapshot(state, frames), last_command)
 
                 with stage("robogui_control"):
                     robogui_control = self._robogui.poll_control()
                 control_diagnostics = getattr(robogui_control, "diagnostics", None)
                 if control_diagnostics is not None:
                     control_status = (
-                        robogui_control.paused, control_diagnostics.get("reason"),
+                        robogui_control.paused,
+                        control_diagnostics.get("reason"),
                         control_diagnostics.get("timeout_count"),
                         control_diagnostics.get("error_count"),
                         control_diagnostics.get("transport_status"),
                     )
                     if control_status != last_control_status:
                         recorder.event(
-                            "robogui_control_state", step=steps,
+                            "robogui_control_state",
+                            step=steps,
                             monotonic_ns=self._clock.now_ns(),
-                            paused=robogui_control.paused, **control_diagnostics,
+                            paused=robogui_control.paused,
+                            **control_diagnostics,
                         )
                         last_control_status = control_status
                 if robogui_control.finish_requested:
                     timing.set_phase("stopped")
                     # Stop model requests before Home/recording cleanup can take time.
-                    self._worker.request_stop()
-                    if robogui_control.finish_home is not None:
+                    if self._worker is not None:
+                        self._worker.request_stop()
+                    if self._external is None and robogui_control.finish_home is not None:
                         home_on_close = robogui_control.finish_home
                     terminal_reason = "robogui_finish_requested"
                     recorder.event("robogui_finish_requested", step=steps, home=home_on_close)
                     break
-                if robogui_control.home_requested:
+                if robogui_control.home_requested and self._external is None:
                     timing.set_phase("homing")
                     self._robot.home()
                     state = self._robot.get_state()
@@ -542,7 +594,8 @@ class EdgeRuntime:
                     pending_observation_states.clear()
                     self._state = RuntimeState.PAUSED
                     recorder.event(
-                        "robogui_home_requested", step=steps,
+                        "robogui_home_requested",
+                        step=steps,
                         state=state_evidence(
                             state, targets=self._config["robot"]["options"].get("start_joints")
                         ),
@@ -565,7 +618,8 @@ class EdgeRuntime:
                         preview_chunk, preview_inference_ms, preview_metadata = preview
                         with stage("robogui_publish_plan"):
                             self._robogui.publish_plan(
-                                preview_chunk, preview_inference_ms,
+                                preview_chunk,
+                                preview_inference_ms,
                                 metadata={
                                     **preview_metadata,
                                     "episode_id": episode_id,
@@ -583,16 +637,19 @@ class EdgeRuntime:
                             "formal_rollout_ready",
                             inference_seed=capabilities.backend_metadata.get("model", {}).get(
                                 "inference_seed"
-                            ), latency_sample_count=len(warmup.latency_ns),
+                            ),
+                            latency_sample_count=len(warmup.latency_ns),
                         )
                     for kind, fields in warmup.take_events():
                         recorder.event(kind, **fields)
                         logger.info("%s %s", kind, fields)
                         with stage("robogui_publish_event"):
                             self._robogui.publish_event(
-                                kind, step=steps,
+                                kind,
+                                step=steps,
                                 metadata={
-                                    **fields, "episode_id": episode_id,
+                                    **fields,
+                                    "episode_id": episode_id,
                                     "run_dir": str(self._run_dir.resolve()),
                                     "runtime": self._strategy.name,
                                 },
@@ -612,7 +669,9 @@ class EdgeRuntime:
                     last_command = copy_group_vector(command.groups)
                     with stage("robogui_publish_state"):
                         self._robogui.publish_state(
-                            state, frames, step=steps,
+                            state,
+                            frames,
+                            step=steps,
                             max_steps=self._config["run"]["max_control_steps"],
                         )
                     next_tick_ns = max(
@@ -652,13 +711,17 @@ class EdgeRuntime:
                     )
                     formal_start_recorded = True
 
-                if not self._worker.is_alive and not worker_failure_reported:
+                if (
+                    self._worker is not None
+                    and not self._worker.is_alive
+                    and not worker_failure_reported
+                ):
                     worker_failure_reported = True
                     recorder.event("policy_worker_stopped", step=steps)
 
                 decoded_chunk = None
                 with stage("worker_poll"):
-                    response = self._worker.poll()
+                    response = None if self._worker is None else self._worker.poll()
                 if response is not None:
                     logger.info(
                         "policy_response seq=%d inference_ms=%.1f error=%s raw=%s",
@@ -732,9 +795,7 @@ class EdgeRuntime:
                                             handoff_skip_steps=(
                                                 0
                                                 if handoff_reference is None
-                                                else self._config["inference"][
-                                                    "handoff_skip_steps"
-                                                ]
+                                                else self._config["inference"]["handoff_skip_steps"]
                                             ),
                                             max_source_steps=self._config["inference"][
                                                 "max_chunk_policy_steps"
@@ -763,10 +824,7 @@ class EdgeRuntime:
                                         if handoff_reference is None
                                         else handoff_reference.plan_id
                                     ),
-                                    seed_to_expected_start_ms=(
-                                        start_ns - seed.monotonic_ns
-                                    )
-                                    / 1e6,
+                                    seed_to_expected_start_ms=(start_ns - seed.monotonic_ns) / 1e6,
                                     expected_decode_ms=round(
                                         self._decode_forecast.seconds * 1e3, 3
                                     ),
@@ -775,9 +833,7 @@ class EdgeRuntime:
                                 response = None
                 if response is not None:
                     request_in_flight = False
-                    observation_state = pending_observation_states.pop(
-                        response.request_seq, None
-                    )
+                    observation_state = pending_observation_states.pop(response.request_seq, None)
                     submission_visuals = pending_visuals.get(response.request_seq, {})
                     rejection_reason = None
                     if response.error is not None:
@@ -1062,9 +1118,7 @@ class EdgeRuntime:
                                             ),
                                             "committed_horizon_steps": committed.horizon_steps,
                                             "time_trimmed_steps": result.time_trimmed_steps,
-                                            "handoff_skipped_steps": (
-                                                result.handoff_skipped_steps
-                                            ),
+                                            "handoff_skipped_steps": (result.handoff_skipped_steps),
                                             "timeline_latency_ms": (
                                                 result.timeline_latency_ns / 1_000_000
                                             ),
@@ -1118,13 +1172,17 @@ class EdgeRuntime:
                                     )
                                 pending_visuals.pop(response.request_seq, None)
 
-                if self._worker.is_alive and not (
-                    (
-                        self._decoder is not None
-                        or self._multi_inflight
-                        or getattr(self._strategy, "discard_plans_while_paused", False)
+                if (
+                    self._worker is not None
+                    and self._worker.is_alive
+                    and not (
+                        (
+                            self._decoder is not None
+                            or self._multi_inflight
+                            or getattr(self._strategy, "discard_plans_while_paused", False)
+                        )
+                        and self._state != RuntimeState.RUNNING
                     )
-                    and self._state != RuntimeState.RUNNING
                 ):
                     snapshot = ObservationSnapshot(state=state, frames=frames)
                     request_state = RequestState(
@@ -1228,6 +1286,33 @@ class EdgeRuntime:
                         self._robogui.publish_event(kind, step=steps, metadata=fields)
 
                 now_ns = self._clock.now_ns()
+                if self._external is not None:
+                    if self._external.stop_needed():
+                        self._robot.stop()
+                        self._timeline = self._build_timeline()
+                        last_command = copy_group_vector(state.groups)
+                        self._executor.reset(state)
+                        self._safety.reset(state)
+                        self._external.acknowledge_stop()
+                    if self._state != RuntimeState.RUNNING:
+                        self._external.request_stop()
+                    chunk = self._external.next_chunk(now_ns, self._control_dt_ns)
+                    if chunk is None:
+                        self._timeline = self._build_timeline()
+                    if chunk is not None:
+                        result = self._timeline.commit(
+                            chunk,
+                            now_ns=now_ns,
+                            max_plan_age_ns=self._control_dt_ns,
+                            current_command=last_command,
+                            blend_steps=0,
+                        )
+                        if not result.accepted:
+                            raise RuntimeError(f"external action rejected: {result.reason}")
+                        accepted_plans += 1
+                        recorder.event(
+                            "external_action", plan_id=chunk.plan_id, request_seq=chunk.request_seq
+                        )
                 with stage("timeline_reference"):
                     reference = self._timeline.reference_horizon(
                         now_ns=now_ns,
@@ -1299,7 +1384,11 @@ class EdgeRuntime:
                         },
                     )
                 try:
-                    self._robot.send_command(command)
+                    if self._external is None:
+                        self._robot.send_command(command)
+                    else:
+                        if not self._external.dispatch(self._robot.send_command, command):
+                            command.groups = copy_group_vector(last_command)
                 except Exception:
                     logger.exception(
                         "command_dispatch_failed runtime_state=%s plan=%s execute=%s "
@@ -1405,6 +1494,8 @@ class EdgeRuntime:
         except BaseException as exc:
             abort_reason = type(exc).__name__
             abort_detail = _exception_detail(exc)
+            if self._external is not None:
+                self._external.failure = exc
             logger.error("episode_aborted %s", abort_detail)
             raise
         finally:
@@ -1423,7 +1514,11 @@ class EdgeRuntime:
                     self._robot.home()
                 except BaseException as exc:
                     cleanup_errors.append(exc)
-            closers = [self._robot.close, self._worker.close]
+            closers = [self._robot.close]
+            if self._worker is not None:
+                closers.append(self._worker.close)
+            if self._external is not None:
+                closers.append(self._external.close)
             if self._decoder is not None:
                 closers.append(self._decoder.close)
             for closer in closers:

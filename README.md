@@ -99,6 +99,11 @@ XPolicyLab and StarVLA have independent serving environments and ManiMux clients
 A new framework can implement the same client interface. A new robot implements component
 and assembly protocols. [Extension map →](docs/development/README.md)
 
+## RPent integration
+
+[Execute RPent YAM VLA actions through ManiMux](docs/integrations/rpent-yam.md),
+using the existing RPent environment interface and ManiMux control loop.
+
 ## Quick start
 
 ### Explore without hardware
