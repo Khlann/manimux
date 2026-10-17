@@ -29,7 +29,7 @@ def main():
     parser.add_argument(
         "--config",
         type=Path,
-        default=REPO / "manimux/configs/experiments/pass_ball/umi_dp/tianji_umi_dp_default.yaml",
+        required=True,
     )
     parser.add_argument("--horizons", type=int, nargs="+", default=[16, 64])
     parser.add_argument("--repeat", type=int, default=3)
@@ -83,7 +83,9 @@ def main():
                     repeat,
                     state.monotonic_ns,
                     state.monotonic_ns,
-                    measured_state=state,
+                    observation_state=state,
+                    ik_seed=state,
+                    ik_seed_source="observation_state",
                 ),
             )
             timings.append((time.perf_counter() - begin) * 1000)

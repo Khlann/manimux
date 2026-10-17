@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
-from collections import deque
+from collections import Counter, deque
 
 from manimux.clock import Clock
 from manimux.policies.worker import PolicyWorkerClient
 from manimux.policy_adapter.base import PolicyAdapter
 from manimux.runtime.inference import (
     InferenceStrategy,
+    StrategyChunkSelector,
     build_warmup_submission,
+    decode_strategy_action,
     seed_strategy_warmup,
 )
 from manimux.timing import stage
@@ -33,13 +35,17 @@ class PolicyWarmup:
         self.adapter = adapter
         self.session_id = session_id
         self.clock = clock
-        self.phase = "warming"
+        self.phase = "idle"
         self.completed_requests = 0
         self.latest_branch: str | None = None
         self.error = ""
+        inference = config["inference"]
+        delay_config = inference.get(inference.get("algorithm", "rtc"), inference["rtc"])
         self.latency_ns: deque[int] = deque(
-            maxlen=config["inference"]["rtc"]["delay_buffer_size"]
+            maxlen=delay_config.get("delay_buffer_size", inference["rtc"]["delay_buffer_size"])
         )
+        self._required_calls = dict(getattr(strategy, "warmup_required_calls", {}))
+        self._branch_calls: Counter[str] = Counter()
         self._recent_ns: deque[int] = deque(maxlen=10)
         self.first_inference_ms: dict[str, float] = {}
         self._request_seq = 0
@@ -49,15 +55,32 @@ class PolicyWarmup:
         self._events: list[tuple[str, dict]] = []
         self._preview: tuple[ActionChunk, float, dict] | None = None
 
+    def activate(self) -> None:
+        """Explicitly enable display-only warmup; repeated activation is harmless."""
+        if self.phase == "idle":
+            self.phase = "warming"
+            self._was_paused = True
+            self._event("warmup_activated")
+
     @property
     def complete(self) -> bool:
         return self.phase == "complete"
+
+    @property
+    def ready(self) -> bool:
+        return all(
+            self._branch_calls[branch] >= count
+            for branch, count in self._required_calls.items()
+        )
 
     def metadata(self) -> dict:
         return {
             "phase": self.phase,
             "completed_requests": self.completed_requests,
             "latest_branch": self.latest_branch,
+            "required_branch_calls": dict(self._required_calls),
+            "completed_branch_calls": dict(self._branch_calls),
+            "branches_ready": self.ready,
             "recent_inference_ms": [round(value / 1e6, 3) for value in self._recent_ns],
             "first_inference_ms": dict(self.first_inference_ms),
             "calibration_sample_count": len(self.latency_ns),
@@ -90,7 +113,7 @@ class PolicyWarmup:
     def _advance(self, *, paused: bool, snapshot: ObservationSnapshot) -> None:
         start_requested = self._was_paused and not paused
         self._was_paused = paused
-        if self.complete:
+        if self.complete or self.phase == "idle":
             return
         if not self.worker.is_alive:
             self.phase = "error"
@@ -117,18 +140,28 @@ class PolicyWarmup:
                 if error is None:
                     try:
                         with stage("policy_decode"):
-                            chunk = self.adapter.decode_action(
+                            chunk = decode_strategy_action(
+                                self.strategy, self.adapter,
                                 response.raw_action,
                                 ActionContext(
                                     request_seq=response.request_seq,
                                     observation_time_ns=response.observation_time_ns,
                                     created_time_ns=response.finished_time_ns,
-                                    measured_state=request.observation.state,
+                                    observation_state=request.observation.state,
+                                    ik_seed=request.observation.state,
+                                    ik_seed_source="observation_state",
                                     max_source_steps=self.config["policy"]["horizon_policy_steps"],
                                 ),
                             )
-                        if chunk.action_space != "joint_position":
-                            raise ValueError("Warmup requires canonical joint-position output")
+                        if isinstance(self.strategy, StrategyChunkSelector):
+                            chunk = self.strategy.select_chunk(
+                                chunk=chunk, now_ns=self.clock.now_ns(),
+                            )
+                        from manimux.runtime.ik import step_ik_enabled
+                        from manimux.policy_adapter.pose_output import POSE_SPACE
+                        expected_space = POSE_SPACE if step_ik_enabled(self.config) else "joint_position"
+                        if chunk.action_space != expected_space:
+                            raise ValueError(f"Warmup requires canonical {expected_space} output")
                     except Exception as exc:  # Keep model/adapter failures visible without motion.
                         error = f"{type(exc).__name__}: {exc}"
                 self.error = error or ""
@@ -141,6 +174,7 @@ class PolicyWarmup:
                         self.latency_ns.append(elapsed_ns)
                         seed_strategy_warmup(self.strategy, latency_ns=list(self.latency_ns))
                     self.completed_requests += 1
+                    self._branch_calls[branch] += 1
                     self.first_inference_ms.setdefault(branch, elapsed_ns / 1e6)
                     if self.phase == "warming":
                         self._preview = (
@@ -163,8 +197,10 @@ class PolicyWarmup:
                         "warmup_inference_failed", branch=branch,
                         request_seq=request.request_seq, error=error,
                     )
+                    if self.phase == "draining" and not self.ready:
+                        self.phase = "error"
 
-        if self.phase == "draining" and self._pending is None:
+        if self.phase == "draining" and self._pending is None and self.ready:
             try:
                 with stage("worker_submit_reset"):
                     self._reset_seq = self.worker.submit_reset(self.session_id)
@@ -187,7 +223,9 @@ class PolicyWarmup:
                     "warmup_reset_failed" if error else "warmup_completed", **self.metadata()
                 )
 
-        if self.phase == "warming" and self._pending is None:
+        if (
+            self.phase == "warming" or (self.phase == "draining" and not self.ready)
+        ) and self._pending is None:
             started_ns = self.clock.now_ns()
             try:
                 # Negative IDs cannot be mistaken for a formal rollout request.

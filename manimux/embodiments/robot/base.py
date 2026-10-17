@@ -14,10 +14,10 @@ import yaml
 from scipy.spatial.transform import Rotation
 
 from manimux.clock import Clock, SystemClock
-from manimux.embodiments.layout import assembly_action_contract, group_layouts
 from manimux.embodiments.arm.base import ArmBase, ArmController, ArmModel
 from manimux.embodiments.end_effector.base import EndEffectorModel
 from manimux.embodiments.end_effector.gripper import GripperBase, GripperCommand
+from manimux.embodiments.layout import assembly_action_contract, group_layouts
 from manimux.embodiments.sensor.base import SensorBase
 from manimux.kinematics.base import FloatArray, ManipulatorKinematicsBase, rigid_transform
 from manimux.kinematics.composed import ComposedManipulatorKinematics
@@ -27,6 +27,8 @@ from manimux.kinematics.tool import FixedToolGeometry
 from manimux.plugins import load_plugin
 from manimux.timing import stage, timed, timed_lock, timing_scope
 from manimux.types import RobotCommand, RobotState, SensorFrame
+
+HandGuidingHandler = Callable[[Sequence[str], threading.Event, Callable[[], None] | None], None]
 
 
 class RobotBase(ABC):
@@ -226,12 +228,19 @@ class RobotBase(ABC):
 
     @property
     def recovery_actions(self) -> tuple[str, ...]:
-        """Supported idle recovery actions: any of "clear_error", "home" and "drag"."""
+        """Supported idle actions, including any robot-owned hand-guiding handlers."""
         return ()
 
     @property
+    def hand_guiding_actions(self) -> Mapping[str, HandGuidingHandler]:
+        """Cancellable recovery handlers; each owns entry, monitoring and cleanup."""
+        return MappingProxyType(
+            {"drag": self.recover_drag} if "drag" in self.recovery_actions else {}
+        )
+
+    @property
     def drag_selections(self) -> Mapping[str, tuple[str, ...]]:
-        """RoboGUI drag choices, mapping each label to the robot groups it moves."""
+        """RoboGUI hand-guiding choices, mapping labels to robot groups."""
         return MappingProxyType({})
 
     def clear_errors(self) -> None:
@@ -332,7 +341,7 @@ class RobotBase(ABC):
             frames = {}
             for name, sensor in self.sensors.items():
                 reading = sensor.read()
-                # 物理组件用装配名；网络数据源保留每帧原有的逻辑相机名。
+                # Physical components use assembly names; network sources retain each frame's logical camera name.
                 frames.update({name: reading} if isinstance(reading, SensorFrame) else reading)
             return frames
 
@@ -402,7 +411,7 @@ class MountedGroup:
     arm: ArmModel
     end_effector_name: str | None
     end_effector: EndEffectorModel | None
-    mount: Frame  # 法兰到独立末端的真实安装关系，参与 TCP 计算。
+    mount: Frame  # Physical flange-to-tool mounting transform used in TCP calculations.
     kinematics: ManipulatorKinematicsBase
 
     def visual_end_effector(self):
@@ -443,7 +452,7 @@ def _read_mapping(path: Path) -> dict:
 
 
 def _mount(value) -> Frame:
-    # Frame 负责读取 xyz/rpy；这里只补充刚体变换的数值约束。
+    # Frame reads xyz/rpy; only add numerical rigid-transform constraints here.
     frame = Frame.model_validate(value)
     # Reuse the common rigid-transform validator, including finite values.
     rigid_transform(frame.matrix(), "mount")
@@ -489,8 +498,8 @@ class RobotModel:
             )
             kind = component["type"]
             component["class"] = factory
-            # 手臂 FK/IK 自带基座坐标；只解析实际工具或相机的安装关系。
-            # RoboGUI 的摆放参数不进入本体模型。
+            # Arm FK/IK includes the base frame; resolve only physical tool or camera mounts.
+            # RoboGUI scene placement does not enter the embodiment model.
             if kind == "end_effector" or (kind == "sensor" and entry.get("mount") is not None):
                 mounts[component_name] = _mount(entry.get("mount"))
             if kind == "arm":
@@ -520,8 +529,8 @@ class RobotModel:
                 mount = mounts[tool_name]
                 used_tools.add(tool_name)
             if tool is None and isinstance(arm.kinematics, ManipulatorKinematicsBase):
-                # null 表示没有额外挂载工具。一体组件已定义自己的 TCP、夹爪和
-                # 坐标布局，直接复用，避免再加一次工具偏移或丢掉夹爪坐标。
+                # null means no additional tool. Integrated components already define their TCP, gripper and
+                # coordinate layout; reuse these to avoid duplicating tool offsets or losing the gripper coordinate.
                 kin = arm.kinematics
             else:
                 geometry = (
@@ -536,7 +545,7 @@ class RobotModel:
                     geometry,
                     arm_coordinates=arm.coordinates,
                     mount=mount.matrix(),
-                    # 上面的 mount 仅连接法兰和工具；输出仍相对该臂基座。
+                    # The mount above connects flange and tool only; output remains relative to the arm base.
                     base_frame=arm.base_frame,
                     position_tolerance=None,
                 )
@@ -567,8 +576,10 @@ class RobotModel:
                 home_joints[group_name] = q
         kin = RobotKinematics({key: value.kinematics for key, value in groups.items()})
         contract = assembly_action_contract(source)
-        layouts = (group_layouts({name: model.num_coordinates for name, model in kin.models.items()},
-                                contract) if contract else {})
+        layouts = (
+            group_layouts({name: model.num_coordinates for name, model in kin.models.items()},
+                         contract) if contract else {}
+        )
         return cls(
             name,
             MappingProxyType(groups),

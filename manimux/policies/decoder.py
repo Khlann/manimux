@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from manimux.policy_adapter import build_policy_adapter
+from manimux.policies.base import attach_sampling_stats
 from manimux.types import ActionChunk, ActionContext, InferenceResponse
 
 
@@ -53,6 +54,7 @@ def _decode_main(
                 chunk = adapter.decode_action(raw, context)
             else:
                 chunk = adapter.decode_action_partition(raw, context, partition)
+            chunk = attach_sampling_stats(chunk, raw)
             if time.monotonic_ns() > deadline_ns:
                 raise TimeoutError("decode deadline exceeded")
         except Exception as exc:
@@ -213,7 +215,7 @@ class ActionDecoderClient:
             return DecodeResult(response, None, ";".join(errors))
         ordered = [self._pieces[p] for p in self._partitions]
         merged = ordered[0][0]
-        # 各分区返回 ActionChunk；合并前只核对时间、动作语义和分组是否一致。
+        # Each partition returns ActionChunk; check timing, action semantics and groups before merging.
         fields = (
             "request_seq",
             "observation_time_ns",

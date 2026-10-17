@@ -138,7 +138,11 @@ def probe_observations(client, adapter, config, report, outputs, *, deterministi
         raw = client.infer(request)
         elapsed = time.perf_counter() - started
         chunk = adapter.decode_action(
-            raw, ActionContext(index, now, time.monotonic_ns(), measured_state=state)
+            raw,
+            ActionContext(
+                index, now, time.monotonic_ns(), observation_state=state,
+                ik_seed=state, ik_seed_source="observation_state",
+            ),
         )
         rows = np.concatenate(list(chunk.groups.values()), axis=-1)
         if not np.isfinite(rows).all():
@@ -239,7 +243,7 @@ def main():
             result = build_runtime(config, run_dir).run()
             report["runtime"] = asdict(result)
             report["rollout_directory"] = str(run_dir)
-            if not result.success or result.rejected_plans or result.accepted_plans < 1:
+            if not result.run_completed or result.rejected_plans or result.accepted_plans < 1:
                 raise RuntimeError(f"Offline runtime did not accept a clean plan: {result}")
         report["status"] = "passed"
     except Exception as exc:
